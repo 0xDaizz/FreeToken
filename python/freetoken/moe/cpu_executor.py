@@ -140,6 +140,60 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     return len(reps), list(reps)
 
 
+def resolve_tp_threads_and_affinity(
+    requested: int, tp_rank: int, tp_size: int
+) -> tuple[int, list[int]]:
+    """Split physical CPU cores into disjoint contiguous TP-rank worker pools.
+
+    Separate scheduler processes inherit the same host affinity, so calling the
+    single-rank resolver independently pins every CPU MoE pool to cores 0..N-1.
+    That oversubscribes exactly the memory-bandwidth path ETP is trying to overlap.
+    Explicit counts leave any tail cores free for NCCL/scheduler work; auto divides
+    the physical cores evenly.
+    """
+    if tp_size <= 1:
+        return resolve_threads_and_affinity(requested)
+    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+        raise ValueError(f"invalid TP rank/size {tp_rank}/{tp_size}")
+    reps = physical_core_cpus()
+    n = int(requested) if requested and requested > 0 else len(reps) // tp_size
+    if n <= 0 or n * tp_size > len(reps):
+        raise ValueError(
+            f"cannot allocate {n} physical CPU MoE threads to each of {tp_size} TP ranks "
+            f"from {len(reps)} available physical cores"
+        )
+    start = tp_rank * n
+    return n, list(reps[start:start + n])
+
+
+def resolve_flag_coord_affinity(
+    requested: int,
+    nthreads: int,
+    core_ids: list[int],
+    *,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+) -> tuple[int, int, list[int]]:
+    """Choose a dedicated physical core for the flag-sync coordinator.
+
+    Auto sizing takes the last core from each rank's own worker pool. Explicit TP
+    sizing preserves the requested workers and uses the rank-indexed tail after all
+    worker pools. ``-1`` retains the unpinned fallback on fully subscribed hosts.
+    """
+    if nthreads <= 2 or not core_ids:
+        return -1, nthreads, core_ids
+    if requested <= 0:
+        return core_ids[-1], nthreads - 1, core_ids[:-1]
+
+    reps = physical_core_cpus()
+    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+        raise ValueError(f"invalid TP rank/size {tp_rank}/{tp_size}")
+    tail_index = nthreads * tp_size + tp_rank
+    if tail_index < len(reps):
+        return reps[tail_index], nthreads, core_ids
+    return -1, nthreads, core_ids
+
+
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
     (bf16, nvfp4, mxfp4_triton, ds_fp4 or q4_0 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
@@ -213,14 +267,22 @@ class CpuMoeExecutor:
                 )
                 self._flag_sync = False
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        from freetoken.distributed import try_get_tp_info
+
+        tp = try_get_tp_info()
+        if tp is not None and tp.size > 1:
+            nthreads, core_ids = resolve_tp_threads_and_affinity(
+                num_threads, tp.rank, tp.size
+            )
+        else:
+            nthreads, core_ids = resolve_threads_and_affinity(num_threads)
         coord_core = -1
-        if self._flag_sync and num_threads == 0 and nthreads > 2:
-            # Auto sizing: give the coordinator the last physical core instead of
-            # oversubscribing (workers drop from N to N-1).
-            coord_core = core_ids[-1]
-            nthreads -= 1
-            core_ids = core_ids[:-1]
+        if self._flag_sync:
+            coord_core, nthreads, core_ids = resolve_flag_coord_affinity(
+                num_threads, nthreads, core_ids,
+                tp_rank=tp.rank if tp is not None else 0,
+                tp_size=tp.size if tp is not None else 1,
+            )
         self._coord_core = coord_core
         self._ext = _cpu_moe.CpuMoeExecutor(
             num_threads=nthreads,
@@ -242,7 +304,14 @@ class CpuMoeExecutor:
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
 
-        spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
+        if tp is not None and tp.size > 1:
+            # The other ranks own their own worker pools.  Only the tail after all
+            # pools is genuinely spare; divide it so torch CPU work cannot overlap a
+            # sibling rank's pinned workers.
+            tail = len(physical_core_cpus()) - nthreads * tp.size
+            spare = tail // tp.size - (1 if coord_core >= 0 else 0)
+        else:
+            spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
         if clamp < torch.get_num_threads():
             logger.info_rank0(
@@ -310,9 +379,10 @@ class CpuMoeExecutor:
                 "(bit-identical grid; the CPU-side scalar round-trip is skipped)"
             )
 
-        logger.info_rank0(
+        log_ready = logger.info if tp is not None and tp.size > 1 else logger.info_rank0
+        log_ready(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
-            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
+            f"{core_ids}) flag_coord_core={self._coord_core} isa={self.isa} fmt={fmt} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )

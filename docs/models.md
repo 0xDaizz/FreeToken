@@ -31,6 +31,26 @@ for them; other checkpoints of the same architectures work too.
   `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
   recommends it.
 
+### DeepSeek-V4 multi-GPU ETP
+
+DeepSeek-V4 supports `--tp-size N` on the offload-family backends as
+expert-intermediate tensor parallel (ETP). The attention trunk, router and shared
+expert stay replicated on every rank; the native FP4 routed experts split their
+intermediate dimension across ranks. Each rank computes a hidden-size partial and
+the existing MoE collective sums those partials before the replicated shared expert
+is added. Thus TP2 stores two complementary half banks instead of duplicating the
+full host expert bank, while the per-GPU cache holds half-sized payloads for the same
+logical LRU expert IDs.
+
+- The checkpoint expert intermediate width must divide evenly into TP ranks and
+  each local width must be 128-aligned (the official V4-Flash `I=2048` supports TP2).
+- Use `offload`, `cpu`, or `hybrid`; resident `fused` DSV4 TP is rejected before
+  weight allocation.
+- `--moe-cpu-threads` is per rank. TP ranks automatically receive disjoint physical
+  core ranges; an explicit count may leave tail cores for the scheduler/collectives.
+- Use the native safetensors checkpoint. Legacy FTW DSV4 banks do not carry rank
+  partition metadata and are rejected under TP>1 rather than loaded once per rank.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into

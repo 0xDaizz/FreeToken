@@ -47,6 +47,13 @@ class ExpertBanks:
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
     streamed: bool = False
+    # Routed-expert tensor-parallel metadata.  Most formats remain unpartitioned;
+    # DSV4 ETP fills these so the engine can reject a full-bank TP duplication before
+    # allocating the GPU cache.
+    expert_tp_rank: int = 0
+    expert_tp_size: int = 1
+    global_intermediate_size: int | None = None
+    local_intermediate_size: int | None = None
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
@@ -257,22 +264,37 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     # no alphas. DeepSeek-V4's own grouped GEMV kernels read them via bank_views().
     # Written as-loaded -> streamable (dummy fabricates in one shot; never streamed).
     sink = None if dummy else layer_sink
+    from freetoken.models.deepseek_v4.weight import resolve_dsfp4_tp_partition
+
+    tp_rank, tp_size, local_I = resolve_dsfp4_tp_partition(args)
+    logger.info(
+        f"DSV4 expert TP partition rank={tp_rank}/{tp_size}: "
+        f"I={args.moe_inter_dim} -> local_I={local_I}"
+    )
     if dummy:
         from freetoken.models.deepseek_v4.weight import dummy_dsfp4_expert_sources
 
-        banks = dummy_dsfp4_expert_sources(args)
+        banks = dummy_dsfp4_expert_sources(args, tp_rank=tp_rank, tp_size=tp_size)
     elif parallel:  # parallel: common chunked multi-threaded O_DIRECT reader
         from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources_parallel
 
         banks = load_dsfp4_expert_sources_parallel(
-            model_path, args, workers=workers, chunk=chunk, layer_sink=sink
+            model_path, args, workers=workers, chunk=chunk, layer_sink=sink,
+            tp_rank=tp_rank, tp_size=tp_size,
         )
     else:
         from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources
 
-        banks = load_dsfp4_expert_sources(model_path, args, layer_sink=sink)
+        banks = load_dsfp4_expert_sources(
+            model_path, args, layer_sink=sink, tp_rank=tp_rank, tp_size=tp_size
+        )
     return ExpertBanks(
-        "ds_fp4", {name: banks[name] for name in _BANK_SCHEMAS["ds_fp4"]}, streamed=sink is not None
+        "ds_fp4", {name: banks[name] for name in _BANK_SCHEMAS["ds_fp4"]},
+        streamed=sink is not None,
+        expert_tp_rank=tp_rank,
+        expert_tp_size=tp_size,
+        global_intermediate_size=args.moe_inter_dim,
+        local_intermediate_size=local_I,
     )
 
 

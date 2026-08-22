@@ -41,6 +41,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
 | `--max-running-requests` | 4 | Max concurrently running requests |
+| `--tensor-parallel-size`, `--tp-size` | 1 | GPU ranks; DeepSeek-V4 uses replicated-trunk expert-intermediate TP on offload-family backends |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
@@ -153,4 +154,3 @@ expert format + GPU name, so a profile from different hardware is ignored
 rather than misapplied. Selection flags: `--dtype`, `--model`, `--formats`,
 `--isa`; decision rule: `--threshold` (default 2.0 — recommend hybrid when CPU
 bandwidth > 2× PCIe).
-

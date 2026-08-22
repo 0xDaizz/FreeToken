@@ -1,10 +1,10 @@
 """Weight loading for DeepSeek-V4-Flash (engine path).
 
-  - :func:`iter_weights` streams resident (non-expert) tensors keyed to engine param
-    names; model's ``load_state_dict`` casts each. ``wo_a`` dequantized to bf16 to match
-    the reference bf16 einsum.
-  - :func:`load_dsfp4_expert_sources` packs routed FP4 experts into pinned CPU banks for
-    the offload cache. DeepSeek FP4: e8m0 per-32 block scale, no global scale.
+- :func:`iter_weights` streams resident (non-expert) tensors keyed to engine param
+  names; model's ``load_state_dict`` casts each. ``wo_a`` dequantized to bf16 to match
+  the reference bf16 einsum.
+- :func:`load_dsfp4_expert_sources` packs routed FP4 experts into pinned CPU banks for
+  the offload cache. DeepSeek FP4: e8m0 per-32 block scale, no global scale.
 """
 
 from __future__ import annotations
@@ -13,12 +13,12 @@ import collections
 import json
 import os
 import re
-from typing import Iterator
 
 import safetensors
 import torch
 from tqdm import tqdm
 
+from freetoken.distributed import try_get_tp_info
 from freetoken.models.loader import drop_page_cache
 
 from .args import DeepseekV4Args, load_args
@@ -59,7 +59,9 @@ def _weight_map(model_path: str) -> dict:
         return json.load(f)["weight_map"]
 
 
-def _dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 128) -> torch.Tensor:
+def _dequant_fp8_block(
+    weight: torch.Tensor, scale: torch.Tensor, block: int = 128
+) -> torch.Tensor:
     """Dequantize 128x128 block-scaled FP8 (e4m3) to bf16.
 
     scale is e8m0 exponent codes, ``value = 2^(code-127)`` (Triton FP8 GEMM convention).
@@ -119,8 +121,9 @@ def iter_weights(
             yield from linear(f"{a}.wkv")
             yield f"{a}.kv_norm.weight", get(f"{a}.kv_norm.weight")
             # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
-            yield f"{a}.wo_a", _dequant_fp8_block(
-                get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
+            yield (
+                f"{a}.wo_a",
+                _dequant_fp8_block(get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")),
             )
             yield from linear(f"{a}.wo_b")
             yield f"{a}.attn_sink", get(f"{a}.attn_sink")
@@ -135,7 +138,10 @@ def iter_weights(
                 if ratio == 4:
                     idx = f"{a}.indexer"
                     yield from linear(f"{idx}.wq_b")
-                    yield f"{idx}.weights_proj.weight", get(f"{idx}.weights_proj.weight")
+                    yield (
+                        f"{idx}.weights_proj.weight",
+                        get(f"{idx}.weights_proj.weight"),
+                    )
                     ic = f"{idx}.compressor"
                     yield f"{ic}.ape", get(f"{ic}.ape")
                     yield f"{ic}.wkv.weight", get(f"{ic}.wkv.weight")
@@ -155,8 +161,12 @@ def iter_weights(
                 yield from linear(f"layers.{L}.ffn.shared_experts.{proj}")
 
             for nm in (
-                "hc_attn_fn", "hc_ffn_fn", "hc_attn_base",
-                "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale",
+                "hc_attn_fn",
+                "hc_ffn_fn",
+                "hc_attn_base",
+                "hc_ffn_base",
+                "hc_attn_scale",
+                "hc_ffn_scale",
             ):
                 yield f"layers.{L}.{nm}", get(f"layers.{L}.{nm}")
     finally:
@@ -172,8 +182,51 @@ _EXPERT_RE = re.compile(
 )
 
 
+def resolve_dsfp4_tp_partition(
+    args: DeepseekV4Args,
+    *,
+    tp_rank: int | None = None,
+    tp_size: int | None = None,
+) -> tuple[int, int, int]:
+    """Return ``(rank, world_size, local_intermediate_size)`` for DSV4 ETP.
+
+    DSV4 keeps the attention trunk and shared expert replicated.  Only the routed
+    expert intermediate dimension is tensor-parallel: every rank owns the matching
+    rows of w1/w3 and columns of w2, then ``OffloadMoELayer`` sums the rank-local
+    hidden-size partials.  Explicit values are accepted for conversion/tests; serving
+    normally resolves them from the process-global TP info.
+    """
+    info = try_get_tp_info()
+    if tp_size is None:
+        tp_size = info.size if info is not None else 1
+    if tp_rank is None:
+        tp_rank = info.rank if info is not None else 0
+    tp_rank, tp_size = int(tp_rank), int(tp_size)
+    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+        raise ValueError(f"invalid DSV4 expert TP rank/size: {tp_rank}/{tp_size}")
+    I = int(args.moe_inter_dim)
+    if I % tp_size:
+        raise ValueError(
+            f"DSV4 expert intermediate size {I} is not divisible by TP size {tp_size}"
+        )
+    local_I = I // tp_size
+    # The W4A8 kernels FP8-round-trip activations in 128-wide blocks and the
+    # down projection stores two FP4 values per byte / one e8m0 scale per 32.
+    if local_I % 128:
+        raise ValueError(
+            f"DSV4 TP local intermediate size {local_I} must be divisible by 128 "
+            f"(global I={I}, TP={tp_size})"
+        )
+    return tp_rank, tp_size, local_I
+
+
 def load_dsfp4_expert_sources(
-    model_path: str, args: DeepseekV4Args, *, layer_sink=None
+    model_path: str,
+    args: DeepseekV4Args,
+    *,
+    layer_sink=None,
+    tp_rank: int | None = None,
+    tp_size: int | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Build pinned CPU DeepSeek-FP4 banks for the routed experts.
 
@@ -187,12 +240,19 @@ def load_dsfp4_expert_sources(
     may release banks it has written out, so the returned tensors are only valid
     until then (the caller owns that tradeoff).
     """
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+    from freetoken.moe.host_banks import (
+        LayerCompletionTracker,
+        PinPipeline,
+        alloc_layer_banks,
+    )
 
     folder = model_path
     weight_map = _weight_map(folder)
     L, E = args.n_layers, args.n_routed_experts
     H, I = args.dim, args.moe_inter_dim
+    tp_rank, tp_size, local_I = resolve_dsfp4_tp_partition(
+        args, tp_rank=tp_rank, tp_size=tp_size
+    )
 
     for shard in sorted(set(weight_map.values())):
         drop_page_cache(os.path.join(folder, shard))
@@ -208,22 +268,31 @@ def load_dsfp4_expert_sources(
 
     e8m0 = torch.float8_e8m0fnu
     specs = {  # alloc UNPINNED, fill, then pin-after-fill (skips slow cudaHostAlloc zero-fill)
-        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
-        "down_packed": ((E, H, I // 2), torch.uint8),
-        "down_scale": ((E, H, I // 32), e8m0),
+        "gate_up_packed": ((E, 2 * local_I, H // 2), torch.uint8),
+        "gate_up_scale": ((E, 2 * local_I, H // 32), e8m0),
+        "down_packed": ((E, H, local_I // 2), torch.uint8),
+        "down_scale": ((E, H, local_I // 32), e8m0),
     }
     hb = alloc_layer_banks(specs, L)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
 
     def _load(sink) -> int:
-        tracker = LayerCompletionTracker(E * 6, hb, sink)  # {w1,w2,w3} x {weight,scale} x experts
+        tracker = LayerCompletionTracker(
+            E * 6, hb, sink
+        )  # {w1,w2,w3} x {weight,scale} x experts
         placed = 0
         for shard in tqdm(sorted(shards), desc="Loading DSV4 FP4 experts"):
             path = os.path.join(folder, shard)
             with safetensors.safe_open(path, framework="pt", device="cpu") as f:
                 for name, m in shards[shard]:
-                    layer = _place_dsfp4(banks, name, f.get_tensor(name), I)
+                    layer = _place_dsfp4(
+                        banks,
+                        name,
+                        f.get_tensor(name),
+                        I,
+                        tp_rank=tp_rank,
+                        tp_size=tp_size,
+                    )
                     tracker.note(layer)
                     placed += 1
             drop_page_cache(path)
@@ -240,18 +309,24 @@ def load_dsfp4_expert_sources(
     return banks
 
 
-def dummy_dsfp4_expert_sources(args: DeepseekV4Args) -> dict[str, list[torch.Tensor]]:
+def dummy_dsfp4_expert_sources(
+    args: DeepseekV4Args,
+    *,
+    tp_rank: int | None = None,
+    tp_size: int | None = None,
+) -> dict[str, list[torch.Tensor]]:
     """Fabricate the 4 ds_fp4 banks for --dummy-weight (no checkpoint on disk)."""
     from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
 
     L, E = args.n_layers, args.n_routed_experts
-    H, I = args.dim, args.moe_inter_dim
+    H = args.dim
+    _, _, local_I = resolve_dsfp4_tp_partition(args, tp_rank=tp_rank, tp_size=tp_size)
     e8m0 = torch.float8_e8m0fnu
     specs = {
-        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
-        "down_packed": ((E, H, I // 2), torch.uint8),
-        "down_scale": ((E, H, I // 32), e8m0),
+        "gate_up_packed": ((E, 2 * local_I, H // 2), torch.uint8),
+        "gate_up_scale": ((E, 2 * local_I, H // 32), e8m0),
+        "down_packed": ((E, H, local_I // 2), torch.uint8),
+        "down_scale": ((E, H, local_I // 32), e8m0),
     }
     hb = alloc_layer_banks(specs, L)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
@@ -268,61 +343,90 @@ def is_expert_tensor(name: str) -> bool:
     return _EXPERT_RE.match(name) is not None
 
 
-def _place_dsfp4(banks: dict, name: str, t: torch.Tensor, I: int) -> int:
+def _place_dsfp4(
+    banks: dict,
+    name: str,
+    t: torch.Tensor,
+    I: int,
+    *,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+) -> int:
     """Copy one expert tensor into its layer/expert slot (shared by serial + parallel
     readers): w1->gate_up[:,:I], w3->gate_up[:,I:], w2->down. Returns the layer index."""
     m = _EXPERT_RE.match(name)
     layer, expert = int(m.group("layer")), int(m.group("expert"))
     proj, kind = m.group("proj"), m.group("kind")
+    if I % tp_size:
+        raise ValueError(f"expert I={I} is not divisible by TP={tp_size}")
+    local_I = I // tp_size
+    lo, hi = tp_rank * local_I, (tp_rank + 1) * local_I
     if kind == "weight":
         t = t.view(torch.uint8)
         if proj == "w1":
-            banks["gate_up_packed"][layer][expert, :I] = t
+            banks["gate_up_packed"][layer][expert, :local_I] = t[lo:hi]
         elif proj == "w3":
-            banks["gate_up_packed"][layer][expert, I:] = t
+            banks["gate_up_packed"][layer][expert, local_I:] = t[lo:hi]
         else:  # w2 -> down
-            banks["down_packed"][layer][expert] = t
+            banks["down_packed"][layer][expert] = t[..., lo // 2 : hi // 2]
     else:  # scale (e8m0)
         if proj == "w1":
-            banks["gate_up_scale"][layer][expert, :I] = t
+            banks["gate_up_scale"][layer][expert, :local_I] = t[lo:hi]
         elif proj == "w3":
-            banks["gate_up_scale"][layer][expert, I:] = t
+            banks["gate_up_scale"][layer][expert, local_I:] = t[lo:hi]
         else:
-            banks["down_scale"][layer][expert] = t
+            banks["down_scale"][layer][expert] = t[..., lo // 32 : hi // 32]
     return layer
 
 
 def load_dsfp4_expert_sources_parallel(
-    model_path: str, args: DeepseekV4Args, *, workers: int = 8, chunk: int = 8 << 20,
+    model_path: str,
+    args: DeepseekV4Args,
+    *,
+    workers: int = 8,
+    chunk: int = 8 << 20,
     layer_sink=None,
+    tp_rank: int | None = None,
+    tp_size: int | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """parallel path: same banks as load_dsfp4_expert_sources, filled from the common
     chunked multi-threaded O_DIRECT reader instead of serial per-shard safe_open.
     ``layer_sink``: see :func:`load_dsfp4_expert_sources`."""
     from freetoken.models.weight import iter_expert_tensors_parallel
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+    from freetoken.moe.host_banks import (
+        LayerCompletionTracker,
+        PinPipeline,
+        alloc_layer_banks,
+    )
 
     L, E = args.n_layers, args.n_routed_experts
     H, I = args.dim, args.moe_inter_dim
+    tp_rank, tp_size, local_I = resolve_dsfp4_tp_partition(
+        args, tp_rank=tp_rank, tp_size=tp_size
+    )
     e8m0 = torch.float8_e8m0fnu
     specs = {
-        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
-        "down_packed": ((E, H, I // 2), torch.uint8),
-        "down_scale": ((E, H, I // 32), e8m0),
+        "gate_up_packed": ((E, 2 * local_I, H // 2), torch.uint8),
+        "gate_up_scale": ((E, 2 * local_I, H // 32), e8m0),
+        "down_packed": ((E, H, local_I // 2), torch.uint8),
+        "down_scale": ((E, H, local_I // 32), e8m0),
     }
     hb = alloc_layer_banks(specs, L)  # lazy host banks (unpinned)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
 
     def _is_expert(name: str) -> bool:
         m = _EXPERT_RE.match(name)
-        return m is not None and int(m.group("layer")) < L  # skip the MTP layer (index L)
+        return (
+            m is not None and int(m.group("layer")) < L
+        )  # skip the MTP layer (index L)
 
     def _load(sink) -> int:
         tracker = LayerCompletionTracker(E * 6, hb, sink)
         placed = 0
-        for name, t in iter_expert_tensors_parallel(model_path, _is_expert, workers=workers, chunk=chunk):
-            layer = _place_dsfp4(banks, name, t, I)
+        for name, t in iter_expert_tensors_parallel(
+            model_path, _is_expert, workers=workers, chunk=chunk
+        ):
+            layer = _place_dsfp4(banks, name, t, I, tp_rank=tp_rank, tp_size=tp_size)
             tracker.note(layer)
             placed += 1
         return placed
@@ -339,8 +443,9 @@ def load_dsfp4_expert_sources_parallel(
 
 
 __all__ = [
+    "is_expert_tensor",
     "iter_weights",
     "load_dsfp4_expert_sources",
     "load_dsfp4_expert_sources_parallel",
-    "is_expert_tensor",
+    "resolve_dsfp4_tp_partition",
 ]

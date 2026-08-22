@@ -43,6 +43,46 @@ def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
         )
 
 
+def _validate_dsv4_expert_partition(config: EngineConfig, banks) -> None:
+    """Fail closed unless DSV4 TP ranks loaded complementary intermediate shards."""
+    args = getattr(config.model_config, "dsv4_args", None)
+    if args is None:
+        return
+    tp = config.tp_info
+    expected_local = args.moe_inter_dim // tp.size
+    if args.moe_inter_dim % tp.size or expected_local % 128:
+        raise ValueError(
+            f"DSV4 expert TP cannot shard I={args.moe_inter_dim} across TP={tp.size} "
+            "into 128-aligned partitions"
+        )
+    got = (
+        getattr(banks, "expert_tp_rank", 0),
+        getattr(banks, "expert_tp_size", 1),
+        getattr(banks, "global_intermediate_size", None),
+        getattr(banks, "local_intermediate_size", None),
+    )
+    expected = (tp.rank, tp.size, args.moe_inter_dim, expected_local)
+    # Legacy TP1 FTW checkpoints predate partition metadata but are unambiguous:
+    # their bank row geometry is the full intermediate width.  TP>1 must never use
+    # this compatibility path because it would recreate the full-bank-per-rank OOM.
+    if tp.size == 1 and got == (0, 1, None, None):
+        got = expected
+    if got != expected:
+        raise RuntimeError(
+            "DSV4 TP expert banks are not rank-sharded; refusing to duplicate the full "
+            f"host bank (got rank/size/global_I/local_I={got}, expected {expected}). "
+            "Use the native safetensors checkpoint with the DSV4 ETP loader; legacy FTW "
+            "checkpoints must be reconverted with partition metadata."
+        )
+    gup = banks.sources["gate_up_packed"][0]
+    down = banks.sources["down_packed"][0]
+    if int(gup.shape[1]) != 2 * expected_local or int(down.shape[2]) != expected_local // 2:
+        raise RuntimeError(
+            f"DSV4 TP bank geometry mismatch: gate_up={tuple(gup.shape)}, "
+            f"down={tuple(down.shape)}, expected local_I={expected_local}"
+        )
+
+
 def _flashinfer_available() -> bool:
     from freetoken.kernel.backend import is_flashinfer_installed
 
@@ -244,14 +284,33 @@ def _make_dummy_weight_state_dict(
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
-    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    # Keep this version-tolerant: newer PyTorch builds add FP8 formats (DSV4 uses
+    # float8_e8m0fnu for MXFP4 scales) while older supported builds may not expose
+    # every spelling below.
+    fp8_dtypes = tuple(
+        dtype
+        for name in (
+            "float8_e4m3fn",
+            "float8_e4m3fnuz",
+            "float8_e5m2",
+            "float8_e5m2fnuz",
+            "float8_e8m0fnu",
+        )
+        if (dtype := getattr(torch, name, None)) is not None
+    )
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
     for key, param in model_state.items():
         if param.dtype in fp8_dtypes:
             # torch.randn is not implemented for fp8; fill via a uint8 view with small
             # codes (avoid NaN/inf fp8 encodings). Lets dummy-weight startup work for
             # block-fp8 models (the dense fp8 linears are fp8 regardless of moe_backend).
             t = torch.empty(param.shape, dtype=param.dtype, device=device)
-            t.view(torch.uint8).random_(0, 16)
+            if e8m0_dtype is not None and param.dtype == e8m0_dtype:
+                # E8M0 code 127 is scale 1.0. Random low bytes would fabricate tiny
+                # scales and collapse DSFP4 dummy outputs toward zero.
+                t.view(torch.uint8).fill_(127)
+            else:
+                t.view(torch.uint8).random_(0, 16)
             state_dict[key] = t
         elif param.dtype.is_floating_point or param.dtype.is_complex:
             state_dict[key] = torch.randn(param.shape, dtype=param.dtype, device=device)
@@ -534,6 +593,7 @@ class Engine:
                 parallel=expert_parallel,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
             )
+            _validate_dsv4_expert_partition(config, banks)
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
                 object.__setattr__(config, "moe_cache_size", size)
@@ -987,6 +1047,14 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     the DSV4 decode batch size.
     """
     model_config = config.model_config
+    tp_size = getattr(getattr(config, "tp_info", None), "size", 1)
+    if tp_size > 1:
+        I = model_config.dsv4_args.moe_inter_dim
+        if I % tp_size or (I // tp_size) % 128:
+            raise ValueError(
+                f"DSV4 ETP requires a 128-aligned expert intermediate partition, "
+                f"got I={I}, TP={tp_size}"
+            )
     model_config.dsv4_args.max_seq_len = config.max_seq_len
     model_config.dsv4_args.max_batch_size = config.max_running_req + 1  # +1 dummy
     # config.swa_full_tokens_ratio is the DSV4 window/full ratio directly (default sizing);
@@ -1291,6 +1359,19 @@ def _adjust_config(config: EngineConfig):
                 "No MoE cache sizing flag given; defaulting to --moe-cache-auto for "
                 f"auto-selected backend {config.moe_backend!r}"
             )
+
+    tp_size = getattr(getattr(config, "tp_info", None), "size", 1)
+    if is_dsv4 and tp_size > 1:
+        if not is_offload_moe_backend(config.moe_backend):
+            raise ValueError(
+                "DeepSeek-V4 multi-GPU currently supports expert-intermediate TP only "
+                "with an offload-family backend (offload/cpu/hybrid); "
+                f"got --moe-backend {config.moe_backend!r}."
+            )
+        logger.info_rank0(
+            f"DeepSeek-V4 ETP enabled: replicated trunk, routed experts sharded over "
+            f"TP={tp_size}, local I={model_config.dsv4_args.moe_inter_dim // tp_size}"
+        )
 
     if is_moe and config.moe_backend == "fused":
         # An explicit 'fused' keeps the experts resident, so there is no slot cache to size. The
