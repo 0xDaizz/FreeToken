@@ -27,5 +27,18 @@ batch size x miss rate.
 python benchmarks/bench_offload_cache_copy.py
 ```
 
+**`bench_dsv4_stream.py`** — exact-token, uncached prompt sweep against an already
+running OpenAI-compatible server. It reports client-observed TTFT, an end-to-end
+prefill approximation (`uncached prompt tokens / TTFT`), and single-stream decode
+from the first through last streamed token. Prompts are unique across repetitions
+and `ignore_eos` keeps the requested decode window fixed.
+
+```bash
+PYTHONPATH=python:. python benchmarks/bench_dsv4_stream.py \
+  --model-path /path/to/DeepSeek-V4-Flash-0731 \
+  --api-url http://127.0.0.1:8000/v1/completions \
+  --out /tmp/dsv4-stream.json
+```
+
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
