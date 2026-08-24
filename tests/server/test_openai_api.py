@@ -417,6 +417,36 @@ def test_omitted_max_tokens_defaults_to_hardcoded_32k():
     assert exp_state.sent.sampling_params.max_tokens == 50
 
 
+def test_server_max_output_tokens_applies_to_openai_omissions_and_explicit_wins():
+    chat_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    chat_state.config.max_output_tokens = 100_000
+    run(handle_chat_completion(
+        ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}]),
+        request=None, state=chat_state, model_sampling={},
+    ))
+    assert chat_state.sent.sampling_params.max_tokens == 100_000
+
+    cmpl_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    cmpl_state.config.max_output_tokens = 100_000
+    run(handle_completion(
+        CompletionRequest(model="m", prompt="hi"),
+        request=None, state=cmpl_state, model_sampling={},
+    ))
+    assert cmpl_state.sent.sampling_params.max_tokens == 100_000
+
+    explicit_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    explicit_state.config.max_output_tokens = 100_000
+    run(handle_chat_completion(
+        ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            max_completion_tokens=77,
+        ),
+        request=None, state=explicit_state, model_sampling={},
+    ))
+    assert explicit_state.sent.sampling_params.max_tokens == 77
+
+
 def test_models_route_returns_served_model_name():
     state = FakeState([])
     app = FastAPI()
@@ -427,6 +457,7 @@ def test_models_route_returns_served_model_name():
     assert response.status_code == 200
     card = response.json()["data"][0]
     assert card["id"] == "unit-model"
+    assert card["max_output_tokens"] == 32768
     # No max_seq_len on this config: null rather than a 500.
     assert card["max_model_len"] is None and card["context_length"] is None
 
@@ -442,6 +473,17 @@ def test_models_route_publishes_the_model_context_length():
 
     assert card["max_model_len"] == 262144
     assert card["context_length"] == 262144
+
+
+def test_models_route_publishes_configured_max_output_tokens():
+    state = FakeState([])
+    state.config.max_output_tokens = 100_000
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+
+    card = TestClient(app).get("/v1/models").json()["data"][0]
+
+    assert card["max_output_tokens"] == 100_000
 
 
 async def _collect(generator):

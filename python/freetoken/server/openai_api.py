@@ -23,6 +23,7 @@ from .api_models import (
 from .function_call_parser import ToolCallItem
 from .request_logger import log_request
 from .generation import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -58,6 +59,7 @@ def _thinking_type(req: Any) -> str | None:
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
@@ -72,7 +74,7 @@ def chat_request_to_genspec(
             temperature=req.temperature,
             top_k=req.top_k,
             top_p=req.top_p,
-            max_tokens=req.max_tokens,
+            max_tokens=default_max_tokens if req.max_tokens is None else req.max_tokens,
             ignore_eos=req.ignore_eos,
             model_sampling=model_sampling,
             stop=req.stop,
@@ -139,6 +141,7 @@ def register_openai_routes(
             root=state.config.model_path,
             max_model_len=ctx,
             context_length=ctx,
+            max_output_tokens=_configured_max_output_tokens(state),
             supported_reasoning_efforts=efforts,
             default_reasoning_effort=default_effort,
         )])
@@ -179,7 +182,11 @@ async def handle_chat_completion(
             )
 
     try:
-        spec = chat_request_to_genspec(req, model_sampling)
+        spec = chat_request_to_genspec(
+            req,
+            model_sampling,
+            default_max_tokens=_configured_max_output_tokens(state),
+        )
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -385,8 +392,9 @@ async def handle_completion(
     unsupported = _completion_unsupported_reason(req)
     if unsupported is not None:
         return create_error_response(unsupported)
+    default_max_tokens = _configured_max_output_tokens(state)
     try:  # surfaces an out-of-range max_tokens as a 400 rather than a 500 from the worker
-        _resolve_sampling(req, model_sampling)
+        _resolve_sampling(req, model_sampling, default_max_tokens)
     except ValueError as exc:
         return create_error_response(str(exc), param="max_tokens")
 
@@ -397,7 +405,11 @@ async def handle_completion(
             return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
         await state.send_one(
-            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(req, model_sampling))
+            TokenizeMsg(
+                uid=uid,
+                text=prompts[0],
+                sampling_params=_resolve_sampling(req, model_sampling, default_max_tokens),
+            )
         )
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
@@ -410,7 +422,11 @@ async def handle_completion(
     cached_tokens = 0
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
-        await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=_resolve_sampling(req, model_sampling)))
+        await state.send_one(TokenizeMsg(
+            uid=uid,
+            text=prompt,
+            sampling_params=_resolve_sampling(req, model_sampling, default_max_tokens),
+        ))
         text = ""
         finish_reason = "stop"
         async for ack in state.wait_for_ack(uid):
@@ -517,16 +533,21 @@ def create_error_response(
 def _resolve_sampling(
     req: ChatCompletionRequest | CompletionRequest,
     model_sampling: dict[str, Any],
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> SamplingParams:
     return resolve_sampling(
         temperature=req.temperature,
         top_k=req.top_k,
         top_p=req.top_p,
-        max_tokens=req.max_tokens,
+        max_tokens=default_max_tokens if req.max_tokens is None else req.max_tokens,
         ignore_eos=req.ignore_eos,
         model_sampling=model_sampling,
         stop=req.stop,
     )
+
+
+def _configured_max_output_tokens(state: Any) -> int:
+    return getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def _tools_for_template(req: ChatCompletionRequest) -> list[dict[str, Any]] | None:

@@ -138,6 +138,9 @@ class ModelCard(BaseModel):
     # `max_model_len` is vLLM/SGLang's, `context_length` what most other clients look for.
     max_model_len: int | None = None
     context_length: int | None = None
+    # Server-side decode budget used when the request omits max_tokens /
+    # max_completion_tokens / max_output_tokens. Explicit request values still win.
+    max_output_tokens: int | None = None
     # The checkpoint's probed effort vocabulary (freetoken.tokenizer.effort); None
     # (not []) when the model has no effort knob or the probe could not run.
     supported_reasoning_efforts: list[str] | None = None
