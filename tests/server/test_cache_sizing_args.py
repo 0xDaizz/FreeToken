@@ -47,3 +47,16 @@ def test_reject_ratio_and_absolute_swa_capacity_together():
             "--swa-num-pages",
             "51",
         )
+
+
+def test_parse_default_reasoning_effort():
+    assert _parse().default_reasoning_effort is None
+    assert (
+        _parse("--default-reasoning-effort", "high").default_reasoning_effort
+        == "high"
+    )
+
+
+def test_reject_unknown_default_reasoning_effort():
+    with pytest.raises(SystemExit):
+        _parse("--default-reasoning-effort", "ultra")

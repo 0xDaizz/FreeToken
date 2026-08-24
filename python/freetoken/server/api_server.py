@@ -698,6 +698,7 @@ def _reasoning_geometry(state: Any) -> dict | None:
     derived = derive_think_gears(
         manager.thinking_profile(),
         parser_configured=bool(getattr(state.config, "reasoning_parser", None)),
+        default_reasoning_effort=getattr(state.config, "default_reasoning_effort", None),
     )
     if derived is None:
         return None

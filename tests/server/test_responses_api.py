@@ -891,6 +891,38 @@ def test_convert_reasoning_field_enables_thinking():
     assert RP.convert_responses_to_genspec(req4, {}).chat_template_kwargs == {}
 
 
+def test_convert_configured_default_reasoning_and_explicit_override():
+    absent = ResponsesRequest.model_validate({"model": "m", "input": "hi"})
+    assert RP.convert_responses_to_genspec(
+        absent, {}, default_reasoning_effort="high"
+    ).chat_template_kwargs == {
+        "enable_thinking": True,
+        "thinking_mode": "enabled",
+        "reasoning_effort": "high",
+    }
+
+    explicit = ResponsesRequest.model_validate(
+        {"model": "m", "input": "hi", "reasoning": {"effort": "low"}}
+    )
+    assert RP.convert_responses_to_genspec(
+        explicit, {}, default_reasoning_effort="high"
+    ).chat_template_kwargs == {
+        "enable_thinking": True,
+        "thinking_mode": "enabled",
+        "reasoning_effort": "low",
+    }
+
+    disabled = ResponsesRequest.model_validate(
+        {"model": "m", "input": "hi", "reasoning": {"effort": "none"}}
+    )
+    assert RP.convert_responses_to_genspec(
+        disabled, {}, default_reasoning_effort="high"
+    ).chat_template_kwargs == {
+        "enable_thinking": False,
+        "thinking_mode": "disabled",
+    }
+
+
 def test_convert_reasoning_effort_none_disables_thinking():
     # vLLM-compatible semantics: an explicit effort "none" DISABLES thinking.
     req = ResponsesRequest.model_validate(

@@ -105,3 +105,25 @@ def test_dsv4_style_toggle_plus_efforts():
     assert gears == ("off", "low", "high", "max") and default == "off"
     assert kwargs["max"]["reasoning_effort"] == "max"
     assert kwargs["max"]["enable_thinking"] is True
+
+
+def test_dsv4_configured_default_overrides_template_default():
+    def render(kwargs, tools):
+        thinking = (
+            bool(tools)
+            or bool(kwargs.get("enable_thinking"))
+            or kwargs.get("thinking_mode") == "enabled"
+        )
+        if not thinking:
+            return "dsv4|chat"
+        effort = kwargs.get("reasoning_effort") or "low"
+        assert effort in ("low", "high", "max")
+        return f"dsv4|think|{effort}"
+
+    gears, default, _ = derive_think_gears(
+        profile_for(render),
+        parser_configured=True,
+        default_reasoning_effort="high",
+    )
+    assert gears == ("off", "low", "high", "max")
+    assert default == "high"

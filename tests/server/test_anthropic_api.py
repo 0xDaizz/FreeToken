@@ -180,6 +180,43 @@ def test_convert_thinking_toggle_broadcasts_every_spelling():
         assert spec.chat_template_kwargs == off, parser
 
 
+def test_convert_configured_default_reasoning_and_explicit_toggle():
+    base = {
+        "model": "m",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    absent = AnthropicMessagesRequest.model_validate(base)
+    assert A.convert_anthropic_to_genspec(
+        absent, {}, default_reasoning_effort="high"
+    ).chat_template_kwargs == {
+        "enable_thinking": True,
+        "thinking_mode": "enabled",
+        "reasoning_effort": "high",
+    }
+
+    disabled = AnthropicMessagesRequest.model_validate(
+        {**base, "thinking": {"type": "disabled"}}
+    )
+    assert A.convert_anthropic_to_genspec(
+        disabled, {}, default_reasoning_effort="high"
+    ).chat_template_kwargs == {
+        "enable_thinking": False,
+        "thinking_mode": "disabled",
+    }
+
+    enabled = AnthropicMessagesRequest.model_validate(
+        {**base, "thinking": {"type": "enabled", "budget_tokens": 1024}}
+    )
+    assert A.convert_anthropic_to_genspec(
+        enabled, {}, default_reasoning_effort="high"
+    ).chat_template_kwargs == {
+        "enable_thinking": True,
+        "thinking_mode": "enabled",
+        "reasoning_effort": "high",
+    }
+
+
 def test_convert_thinking_only_assistant_message_keeps_empty_content():
     # Truncated-then-resent turn: survives with content="" for templates that
     # concatenate message.content unconditionally.

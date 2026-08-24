@@ -11,7 +11,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
-from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
+from freetoken.tokenizer.effort import (
+    EFFORT_SCALE,
+    KNOWN_REASONING_EFFORTS,
+    quantize_effort,
+)
 
 from .api_models import (
     ChatCompletionRequest,
@@ -60,14 +64,20 @@ def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    default_reasoning_effort: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
 
     ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
-    if req.reasoning_effort or thinking_type:
-        ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    effort = (
+        default_reasoning_effort
+        if req.reasoning_effort is None
+        else req.reasoning_effort
+    )
+    if effort or thinking_type:
+        ctk = effort_toggle_kwargs(effort, ctk, thinking_type=thinking_type)
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(
@@ -186,6 +196,9 @@ async def handle_chat_completion(
             req,
             model_sampling,
             default_max_tokens=_configured_max_output_tokens(state),
+            default_reasoning_effort=getattr(
+                state.config, "default_reasoning_effort", None
+            ),
         )
     except ValueError as exc:
         return create_error_response(str(exc))
@@ -690,7 +703,12 @@ async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
     if not served:
         return None, None
     ordered = sorted(served, key=lambda name: -EFFORT_SCALE.get(name, 0.0))
-    return ordered, profile.default
+    configured = getattr(state.config, "default_reasoning_effort", None)
+    mapped = quantize_effort(configured, profile)
+    default = mapped if mapped in served else profile.default
+    if configured in ("off", "none"):
+        default = "off"
+    return ordered, default
 
 
 def _served_model_name(state: Any) -> str:

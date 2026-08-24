@@ -29,12 +29,17 @@ def run(coro):
 
 
 class FakeState:
-    def __init__(self, reasoning_parser: str | None = None) -> None:
+    def __init__(
+        self,
+        reasoning_parser: str | None = None,
+        default_reasoning_effort: str | None = None,
+    ) -> None:
         self.config = SimpleNamespace(
             model_path="/models/unit-model",
             served_model_name="unit-model",
             tool_call_parser="llama3",
             reasoning_parser=reasoning_parser,
+            default_reasoning_effort=default_reasoning_effort,
         )
         self.sent: TokenizeMsg | None = None
 
@@ -181,6 +186,29 @@ def test_anthropic_style_thinking_dict_works():
     assert state.sent.chat_template_kwargs == ON
 
 
+def test_configured_default_effort_applies_and_explicit_request_wins():
+    state = FakeState(reasoning_parser="qwen3", default_reasoning_effort="high")
+    response = run(handle_chat_completion(chat_request(), None, state, {}))
+    assert not isinstance(response, JSONResponse)
+    assert state.sent.chat_template_kwargs == {**ON, "reasoning_effort": "high"}
+
+    response = run(
+        handle_chat_completion(
+            chat_request(reasoning_effort="low"), None, state, {}
+        )
+    )
+    assert not isinstance(response, JSONResponse)
+    assert state.sent.chat_template_kwargs == {**ON, "reasoning_effort": "low"}
+
+    response = run(
+        handle_chat_completion(
+            chat_request(reasoning_effort="off"), None, state, {}
+        )
+    )
+    assert not isinstance(response, JSONResponse)
+    assert state.sent.chat_template_kwargs == OFF
+
+
 def test_stream_returns_400_when_the_template_rejects_the_render():
     state = FakeState()
     state.frontend_tokenizer = lambda: FakeManager(
@@ -225,6 +253,20 @@ def test_v1_models_publishes_the_probed_efforts():
     card = _models_payload(state)
     assert card["supported_reasoning_efforts"] == ["xhigh", "medium", "low"]
     assert card["default_reasoning_effort"] == "xhigh"
+
+
+def test_v1_models_publishes_the_configured_default_effort():
+    state = FakeState(default_reasoning_effort="high")
+    state.frontend_tokenizer = lambda: FakeManager(
+        profile=EffortProfile(
+            supported=frozenset({"max", "high", "low"}),
+            default="low",
+            consumes_effort=True,
+        )
+    )
+    card = _models_payload(state)
+    assert card["supported_reasoning_efforts"] == ["max", "high", "low"]
+    assert card["default_reasoning_effort"] == "high"
 
 
 def test_v1_models_omits_efforts_without_a_frontend_tokenizer():

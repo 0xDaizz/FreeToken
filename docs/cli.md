@@ -43,6 +43,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--tensor-parallel-size`, `--tp-size` | 1 | GPU ranks; DeepSeek-V4 uses replicated-trunk expert-intermediate TP on offload-family backends |
 | `--max-output-tokens` | 32768 | Default output budget for omitted OpenAI Chat, Completions, and Responses limits |
+| `--default-reasoning-effort` | checkpoint default | Default effort for omitted Chat, Responses, and Anthropic requests; explicit request values win |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |

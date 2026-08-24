@@ -18,6 +18,7 @@ from freetoken.tokenizer.effort import (
     THINKING_ON_KWARGS,
     ThinkingProfile,
     effective_efforts,
+    quantize_effort,
 )
 
 
@@ -31,7 +32,9 @@ def thinking_toggle_kwargs(enabled: bool) -> dict:
 
 
 def derive_think_gears(
-    profile: ThinkingProfile, parser_configured: bool
+    profile: ThinkingProfile,
+    parser_configured: bool,
+    default_reasoning_effort: str | None = None,
 ) -> Tuple[Tuple[str, ...], str | None, dict] | None:
     """``(gears, default_gear, kwargs_per_gear)`` for the /v1/cache/status
     ``geometry.reasoning`` block, derived from the checkpoint's probed thinking
@@ -83,6 +86,11 @@ def derive_think_gears(
         )
     else:
         default = "on" if "on" in gears else gears[-1]
+    configured = quantize_effort(default_reasoning_effort, efforts)
+    if configured in gears:
+        default = configured
+    elif default_reasoning_effort in _DISABLE_EFFORTS and "off" in gears:
+        default = "off"
     return tuple(gears), default, kwargs
 
 
