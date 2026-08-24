@@ -109,6 +109,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _open_closed_ratio(value: str) -> float:
+        try:
+            ratio = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number in (0, 1]") from exc
+        if not 0 < ratio <= 1:
+            raise argparse.ArgumentTypeError("must be in (0, 1]")
+        return ratio
+
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
             from freetoken.utils import cached_load_hf_config
@@ -335,6 +344,29 @@ def parse_args(
             "Total KV-cache capacity in tokens; must be a multiple of the resolved page "
             "size (DSV4: 128 window page, TRTLLM backend: 64). Mutually exclusive with "
             "--num-pages."
+        ),
+    )
+
+    swa_capacity_group = parser.add_mutually_exclusive_group()
+    swa_capacity_group.add_argument(
+        "--swa-full-tokens-ratio",
+        type=_open_closed_ratio,
+        default=ServerArgs.swa_full_tokens_ratio,
+        help=(
+            "Window-cache capacity as a fraction of the full KV-token capacity for DSV4 "
+            "and radix-SWA models. Lower values preserve full-context capacity and MoE-cache "
+            "slots at the cost of retaining fewer reusable window-prefix tokens."
+        ),
+    )
+    swa_capacity_group.add_argument(
+        "--swa-num-pages",
+        dest="swa_num_pages_override",
+        type=_positive_int,
+        default=ServerArgs.swa_num_pages_override,
+        help=(
+            "Pin usable window-cache capacity in the window pool's own page unit "
+            "(DSV4: 128 tokens per page; radix-SWA: one token). Mutually exclusive with "
+            "--swa-full-tokens-ratio."
         ),
     )
 
